@@ -1,6 +1,10 @@
+// custom constants
+const fake_maps_path = "/data/data/com.com.sec2023.rocketmouse.mouse/fake_maps";
+const fake_path_addr = Memory.allocUtf8String(fake_maps_path);
+
 let install_filter = null, syscall_thread_ptr, call_task, lock, unlock, findSoinfoByAddr, solist_get_head_ptr, get_soname, get_base, get_size, maps = [];
 const MAX_STACK_TRACE_DEPTH = 10;
-const Target_NR = 207;
+const Target_NR = 63;
 const prctl_ptr = Module.findExportByName(null, 'prctl')
 const strcpy_ptr = Module.findExportByName(null, 'strcpy')
 const fopen_ptr = Module.findExportByName(null, 'fopen')
@@ -27,8 +31,15 @@ for (let index = 0; index < linker_symbols.length; index++) {
     }
 }
 
+
+function sleep(delay) {
+    var start = new Date().getTime();
+    while (new Date().getTime() < start + delay);
+}
+
 function init() {
     //初始化，需要在主线程初始化且需要一个比较早的时机，frida脚本运行在它自己创建的一个线程，所以需要通过hook安装seccomp规则
+    
     syscall_thread_ptr = new NativeFunction(cm.pthread_syscall_create, "pointer", [])()
     findSoinfoByAddr = new NativeFunction(cm.findSoinfoByAddr, "pointer", ["pointer"])
     get_base = new NativeFunction(cm.get_base, "uint64", ["pointer"])
@@ -60,8 +71,37 @@ function init() {
             loginfo += "\n" + stacktrace(ptr(current_off), details.context.fp, details.context.sp).map(addrToString).join('\n')
             // 打印传参
             loginfo += "\nargs = " + JSON.stringify(args_reg_arr)
-            // 调用线程syscall 赋值x0寄存器
-            details.context.x0 = call_task(syscall_thread_ptr, args, 0)
+            if(nr == 56){
+                // 解析openat pathname参数
+                var pathname = Memory.readCString(args_reg_arr["arg1"])
+                loginfo += "\noriginal pathname = " + pathname + "\n"
+                if (pathname.indexOf("/proc/self/maps") != -1) {
+                    // 替换pathname, arg2
+                    loginfo += "\nfake_path_addr = " + fake_path_addr.toString()
+                    loginfo += "\nx1 = " + details.context.x1.toString()
+                    args.add(8 * (1 + 1)).writePointer(fake_path_addr)
+                    details.context.x1 = fake_path_addr
+                }
+            } else if (nr == 63) {
+                // read
+                // var read_content = Memory.readCString(args_reg_arr["arg1"], eval(args_reg_arr["arg2"].toString()))
+                var read_content = Memory.readCString(args_reg_arr["arg1"])
+                loginfo += "\ncontent = " + read_content + "\n"
+            } else if (nr == 64){
+                // write
+                var read_content = Memory.readCString(args_reg_arr["arg1"], eval(args_reg_arr["arg2"].toString()))
+                loginfo += "\ncontent = " + read_content + "\n"
+            } else if (nr == 117) {
+                // ptrace
+            } else if (nr == 172){
+                loginfo += "\ngetpid?"
+            }
+            // 调用线程syscall 赋值x0寄存器, 排除kill exit
+            if (nr != 93 && nr != 129){
+                // loginfo += "\nkill hooked"
+                send("kill hooked")
+                details.context.x0 = call_task(syscall_thread_ptr, args, 0)
+            }
             loginfo += "\nret = " + details.context.x0.toString()
             // 打印信息
             call_thread_log(loginfo)
@@ -71,8 +111,16 @@ function init() {
         }
         return false;
     })
-    // openat的调用号
-    install_filter(Target_NR)
+    // 目标系统调用的调用号
+    // install_filter(56) // openat
+    // install_filter(63) // read
+    // install_filter(64) // write
+    // install_filter(172) // getpid
+    // install_filter(117) // ptrace
+    // install_filter(78) // readlinkat
+    // install_filter(80) //fseek
+    // install_filter(93) // exit
+    install_filter(129) // kill
 }
 
 // CModule模块编写
@@ -210,11 +258,10 @@ void *call_log(void *args){
     return NULL;
 }
 
-void *call_read_maps(void *args){
+void *call_read_maps(void *args, char* _line){
     uint64_t addr = (uint64_t) args;
     FILE *fp = fopen("/proc/self/maps", "r");
     char line[1024];
-    char _line[1024];
     uint64_t start, end;
     while (fgets(line, sizeof(line), fp) != NULL) {
         strcpy(_line, line);
@@ -243,6 +290,7 @@ void *call_task(thread_syscall_t *syscall_thread,void *args,int type){
 }
 
 void *pthread_syscall(void *args){
+    char _line[1024];
     thread_syscall_t *syscall_thread = (thread_syscall_t *)args;
     while(1){
         if(syscall_thread->isTask){
@@ -251,7 +299,7 @@ void *pthread_syscall(void *args){
             }else if(syscall_thread->type == 1){
                 syscall_thread->ret = call_log(syscall_thread->args);
             }else if(syscall_thread->type == 2){
-                syscall_thread->ret = call_read_maps(syscall_thread->args);
+                syscall_thread->ret = call_read_maps(syscall_thread->args, _line);
             }
             syscall_thread->args = NULL;
             syscall_thread->isReturn = 1;
@@ -299,7 +347,7 @@ struct sock_fprog {
 int install_filter(__u32 nr) {
     log("install_filter(%lu)",nr);
     struct sock_filter filter[] = {
-            BPF_STMT(BPF_LD + BPF_W + BPF_ABS, 0),
+            BPF_STMT(BPF_LD + BPF_W + BPF_ABS, (offsetof(struct seccomp_data, nr))),
             BPF_JUMP(BPF_JMP + BPF_JEQ + BPF_K, nr, 0, 1),
             BPF_STMT(BPF_RET + BPF_K, SECCOMP_RET_TRAP),
             BPF_STMT(BPF_RET + BPF_K, SECCOMP_RET_ALLOW),
@@ -349,6 +397,75 @@ Interceptor.attach(Module.findExportByName(null, "android_dlopen_ext"), {
     }
 })
 
+// hook System.exit()
+Java.perform(function () {
+    send("Hook System.exit()");
+
+    var sys = Java.use("java.lang.System");
+    sys.exit.overload("int").implementation = function(var_0) {
+        send("java.lang.System.exit(I)V  // We avoid exiting the application  :)");
+    };
+
+    send("Done Java hooks installed.");
+});
+
+// hook msgbox
+Java.perform(function () {
+let Sec2023MsgBox = Java.use("com.tencent.games.sec2023.Sec2023MsgBox");
+    Sec2023MsgBox["show"].implementation = function (str) {
+        send('show is called' + ', ' + 'str: ' + str);
+        // let ret = this.show(str);
+        // send('show ret value is ' + ret);
+        // return ret;
+    };
+});
+
+function nativeHook(){
+    send("Native hook start")
+    // hook native
+    // Interceptor.attach(Module.findBaseAddress('libsec2023.so').add(0x32AE4),{
+    //     onEnter : function(args){
+    //         send("AES onEnter:",args[0],args[1],args[2]);
+    //     },
+    //     onLeave : function(retval){
+    //         send("AES return")
+    //     }
+    // })
+    var patch_offset = 0x465674;
+    var target = Module.findBaseAddress('libil2cpp.so').add(patch_offset);
+    Memory.patchCode(target, 4, function (target) {
+        var cw = new Arm64Writer(target, { pc: target });
+        cw.putAddRegRegImm('w1', 'w0', 0x3e8);
+        cw.flush();
+    });
+}
+setTimeout(nativeHook, 10*1000)
+// function hook_pthread_create(){
+//     var pt_create_func = Module.findExportByName(null,'pthread_create');
+//     var detect_frida_loop_addr = null;
+//     console.log('pt_create_func:',pt_create_func);
+ 
+//    Interceptor.attach(pt_create_func,{
+//        onEnter:function(){
+//            if(detect_frida_loop_addr == null)
+//            {
+//                 var base_addr = Module.getBaseAddress('libsec2023.so');
+//                 if(base_addr != null){
+//                     // detect_frida_loop_addr = base_addr.add(0xe9c)
+//                     console.log('this.context.x2: ', detect_frida_loop_addr , this.context.x2);
+//                     // if(this.context.x2.compare(detect_frida_loop_addr) == 0) {
+//                     //     hook_anti_frida_replace(this.context.x2);
+//                     // }
+//                 }
+ 
+//            }
+ 
+//        },
+//        onLeave : function(retval){
+//            // console.log('retval',retval);
+//        }
+//    })
+// }
 
 const byteToHex = [];
 
