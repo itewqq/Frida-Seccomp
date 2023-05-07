@@ -7,8 +7,9 @@ import time
 import subprocess
 import threading
 
+adb = "C:\\Users\\itemqq\\androidSdk\\platform-tools\\adb.exe"
 package_name = sys.argv[1]
-jscode = open("./handleSeccomp.js").read()
+jscode = open("./handleSeccomp.js", encoding="utf-8").read()
 dir_path = ""
 
 device = frida.get_device_manager().enumerate_devices()[-1]
@@ -21,6 +22,7 @@ event = threading.Event()
 
 def on_spawned(spawn):
     print('on_spawned:', spawn)
+    print(spawn.report)
     pending.append(spawn)
     event.set()
 
@@ -29,7 +31,7 @@ def spawn_added(spawn):
     if(spawn.identifier.startswith(package_name)):
         print('spawn_added:', spawn)
         session = device.attach(spawn.pid)
-        subprocess.Popen(args="adb logcat --pid={} | grep seccomp > {}/{}_{}.log".format(spawn.pid, dir_path, package_name, spawn.pid), stdin=None, stdout=None,stderr=None, shell=True)
+        subprocess.Popen(args=adb+" logcat --pid={} | findstr seccomp > {}/{}_{}.log".format(spawn.pid, dir_path, package_name, spawn.pid), stdin=None, stdout=None,stderr=None, shell=True)
         script = session.create_script(jscode)
         script.on('message', on_message)
         script.load()
@@ -65,7 +67,7 @@ dir_path = "{}_{}_{}".format(package_name ,pid,time.time())
 os.makedirs(dir_path)
 session = device.attach(pid)
 print("[*] Attach Application {} pid:".format(package_name),pid)
-subprocess.Popen(args="adb logcat --pid={} | grep seccomp > {}/{}_{}.log".format(pid, dir_path, package_name, pid), stdin=None, stdout=None,stderr=None, shell=True)
+subprocess.Popen(args=adb+" logcat --pid={} | findstr seccomp > {}/{}_{}.log".format(pid, dir_path, package_name, pid), stdin=None, stdout=None,stderr=None, shell=True)
 print("[*] Application onResume")
 script = session.create_script(jscode)
 script.on('message', on_message)
